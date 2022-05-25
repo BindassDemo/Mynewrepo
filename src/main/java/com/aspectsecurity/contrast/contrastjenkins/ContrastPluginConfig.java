@@ -1,22 +1,29 @@
 package com.aspectsecurity.contrast.contrastjenkins;
 
+import com.contrastsecurity.exceptions.UnauthorizedException;
+import com.contrastsecurity.models.Organizations;
 import com.contrastsecurity.sdk.ContrastSDK;
 import hudson.Extension;
 import hudson.model.AbstractProject;
 import hudson.model.JobProperty;
 import hudson.model.JobPropertyDescriptor;
+import hudson.model.Result;
 import hudson.util.CopyOnWriteList;
 import hudson.util.FormValidation;
 import hudson.util.ListBoxModel;
+import hudson.util.Secret;
 import jenkins.model.Jenkins;
 import net.sf.json.JSONArray;
 import net.sf.json.JSONObject;
+import org.apache.commons.lang.StringUtils;
 import org.kohsuke.stapler.DataBoundConstructor;
 import org.kohsuke.stapler.QueryParameter;
 import org.kohsuke.stapler.StaplerRequest;
 
 import javax.servlet.ServletException;
 import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Collection;
 
 /**
  * Contrast Plugin Configuration
@@ -24,7 +31,6 @@ import java.io.IOException;
  * Adds the necessary configuration options to a job's properties. Used in VulnerabilityTrendRecorder
  */
 public class ContrastPluginConfig extends JobProperty<AbstractProject<?, ?>> {
-    private String teamServerProfileName;
 
     @DataBoundConstructor
     public ContrastPluginConfig() {
@@ -33,34 +39,21 @@ public class ContrastPluginConfig extends JobProperty<AbstractProject<?, ?>> {
 
     @Override
     public ContrastPluginConfigDescriptor getDescriptor() {
-        return (ContrastPluginConfigDescriptor) Jenkins.getInstance().getDescriptor(getClass());
-    }
+        Jenkins instance = Jenkins.getInstance();
 
-    public static ContrastPluginConfigDescriptor getContrastConfigDescriptor() {
-        return (ContrastPluginConfigDescriptor) Jenkins.getInstance().getDescriptor(ContrastPluginConfig.class);
-    }
-
-    public TeamServerProfile getProfile() {
-        return getProfile(teamServerProfileName);
-    }
-
-    public static TeamServerProfile getProfile(String profileName) {
-        final TeamServerProfile[] profiles = new ContrastPluginConfigDescriptor().getTeamServerProfiles();
-
-        if (profileName == null && profiles.length > 0)
-            return profiles[0];
-
-        for (TeamServerProfile profile : profiles) {
-            if (profile.getName().equals(profileName))
-                return profile;
+        if (instance != null) {
+            return (ContrastPluginConfigDescriptor) instance.getDescriptor(getClass());
+        } else {
+            return null;
         }
-        return null;
     }
 
     @Extension
     public static class ContrastPluginConfigDescriptor extends JobPropertyDescriptor {
 
         private CopyOnWriteList<TeamServerProfile> teamServerProfiles = new CopyOnWriteList<>();
+
+        private CopyOnWriteList<GlobalThresholdCondition> globalThresholdConditions = new CopyOnWriteList<>();
 
         public ContrastPluginConfigDescriptor() {
             super(ContrastPluginConfig.class);
@@ -81,52 +74,164 @@ public class ContrastPluginConfig extends JobProperty<AbstractProject<?, ?>> {
                 }
             }
 
+            // refresh all org rules and applications
+            for (TeamServerProfile teamServerProfile : teamServerProfiles) {
+                ContrastSDK contrastSDK = VulnerabilityTrendHelper.createSDK(teamServerProfile.getUsername(), teamServerProfile.getServiceKey(),
+                        teamServerProfile.getApiKey(), teamServerProfile.getTeamServerUrl());
+
+                teamServerProfile.setVulnerabilityTypes(VulnerabilityTrendHelper.saveRules(contrastSDK, teamServerProfile.getOrgUuid()));
+
+                teamServerProfile.setApps(VulnerabilityTrendHelper.saveApplicationIds(contrastSDK, teamServerProfile.getOrgUuid()));
+            }
+
+
+            final JSONArray globalThresholdConditionJsonArray = json.optJSONArray("globalThresholdCondition");
+
+            if (globalThresholdConditionJsonArray != null) {
+                globalThresholdConditions.replaceBy(req.bindJSONToList(GlobalThresholdCondition.class, globalThresholdConditionJsonArray));
+            } else {
+                if (json.keySet().isEmpty()) {
+                    globalThresholdConditions = new CopyOnWriteList<>();
+                } else {
+                    globalThresholdConditions.replaceBy(req.bindJSON(GlobalThresholdCondition.class, json.getJSONObject("globalThresholdCondition")));
+                }
+            }
+
             save();
 
             return true;
         }
 
-        /** Validates the configured TeamServer profile by attempting to get the default profile for the username.
+        @SuppressWarnings("unused")
+        public ListBoxModel doFillTeamServerProfileNameItems() {
+            return VulnerabilityTrendHelper.getProfileNames();
+        }
+
+        /**
+         * Fills the Threshold Category select drop down with vulnerability types for the configured profile.
          *
-         * @param username      String username for the TeamServer user
-         * @param apiKey        String apiKey for the TeamServer user
-         * @param serviceKey    String serviceKey for the TeamServer user
-         * @param teamServerUrl String TeamServer Url for
+         * @return ListBoxModel filled with vulnerability types.
+         */
+        public ListBoxModel doFillThresholdVulnTypeItems(@QueryParameter("teamServerProfileName") final String teamServerProfileName) throws IOException {
+            return VulnerabilityTrendHelper.getVulnerabilityTypes(teamServerProfileName);
+        }
+
+        /**
+         * Validates the configured TeamServer profile by attempting to get the default profile for the username.
+         *
+         * @param username      String username of the TeamServer user
+         * @param apiKey        String apiKey of the TeamServer user
+         * @param serviceKey    String serviceKey of the TeamServer user
+         * @param teamServerUrl String TeamServer Url
          * @return FormValidation
          * @throws IOException
          * @throws ServletException
          */
-        public FormValidation doTestTeamServerConnection(@QueryParameter("ts.username") final String username,
-                                                         @QueryParameter("ts.apiKey") final String apiKey,
-                                                         @QueryParameter("ts.serviceKey") final String serviceKey,
-                                                         @QueryParameter("ts.teamServerUrl") final String teamServerUrl) throws IOException, ServletException {
-            ContrastSDK contrastSDK;
+        public FormValidation doTestTeamServerConnection(@QueryParameter("username") final String username,
+                                                         @QueryParameter("apiKey") final Secret apiKey,
+                                                         @QueryParameter("serviceKey") final Secret serviceKey,
+                                                         @QueryParameter("teamServerUrl") final String teamServerUrl) throws IOException, ServletException {
+
+            if (StringUtils.isEmpty(username)) {
+                return FormValidation.error("Connection error: Username cannot be empty.");
+            }
+
+            if (StringUtils.isEmpty(apiKey.getPlainText())) {
+                return FormValidation.error("Connection error: Api Key cannot be empty.");
+            }
+
+            if (StringUtils.isEmpty(serviceKey.getPlainText())) {
+                return FormValidation.error("Connection error: Service Key cannot be empty");
+            }
+
+            if (StringUtils.isEmpty(teamServerUrl)) {
+                return FormValidation.error("Connection error: Contrast URL cannot be empty.");
+            }
+
+            if (!teamServerUrl.endsWith("/Contrast/api")) {
+                return FormValidation.error("Connection error: Contrast Url does not end with /Contrast/api.");
+            }
 
             try {
-                contrastSDK = new ContrastSDK(username, serviceKey, apiKey, teamServerUrl);
+                ContrastSDK contrastSDK = VulnerabilityTrendHelper.createSDK(username, serviceKey.getPlainText(), apiKey.getPlainText(), teamServerUrl);
 
-                contrastSDK.getProfileDefaultOrganizations();
+                Organizations organizations = contrastSDK.getProfileDefaultOrganizations();
 
-                return FormValidation.ok("Successfully verified the connection to TeamServer!");
-            } catch (Exception e) {
-                return FormValidation.error("TeamServer Connection error: " + e.getMessage());
+                if (organizations == null || organizations.getOrganization() == null) {
+                    return FormValidation.error("Connection error: No organization found, Check your credentials and URL.");
+                }
+                Collection<FormValidation> validationCollection = new ArrayList<>();
+
+                validationCollection.add(FormValidation.ok("Successfully connected to Contrast."));
+
+                if(VulnerabilityTrendHelper.isEnabledJobOutcomePolicyExist(contrastSDK,organizations.getOrganization().getOrgUuid())) {
+                    validationCollection.add(FormValidation.warning("Your Contrast administrator has set a policy for vulnerability thresholds. " +
+                        "The Contrast policy overrides Jenkins security controls for applications included in both."));
+                }
+                return FormValidation.aggregate(validationCollection);
+            } catch (IOException | UnauthorizedException e) {
+                return FormValidation.error(String.format("Unable to connect to Contrast. %s", e.getMessage()));
             }
         }
 
         public TeamServerProfile[] getTeamServerProfiles() {
             final TeamServerProfile[] profileArray = new TeamServerProfile[teamServerProfiles.size()];
+
             return teamServerProfiles.toArray(profileArray);
         }
 
-        @SuppressWarnings("unused")
-        public ListBoxModel doFillTeamServerProfileNameItems() {
-            final ListBoxModel model = new ListBoxModel();
+        public GlobalThresholdCondition[] getGlobalThresholdConditions() {
+            final GlobalThresholdCondition[] globalThresholdConditionArray = new GlobalThresholdCondition[globalThresholdConditions.size()];
 
-            for (TeamServerProfile profile : teamServerProfiles) {
-                model.add(profile.getName(), profile.getName());
+            return globalThresholdConditions.toArray(globalThresholdConditionArray);
+        }
+
+        /**
+         * Fills the Threshold Severity select drop down with severities for the configured application.
+         *
+         * @return ListBoxModel filled with severities.
+         */
+        public ListBoxModel doFillThresholdSeverityItems() {
+            return VulnerabilityTrendHelper.getSeverityListBoxModel();
+        }
+
+        /**
+         * Validation of the 'thresholdCount' form Field.
+         *
+         * @param value This parameter receives the value that the user has typed.
+         * @return Indicates the outcome of the validation. This is sent to the browser.
+         */
+        public FormValidation doCheckThresholdCount(@QueryParameter String value) {
+
+            if (!value.isEmpty()) {
+                try {
+                    int temp = Integer.parseInt(value);
+
+                    if (temp < 0) {
+                        return FormValidation.error("Please enter a positive integer.");
+                    }
+
+                } catch (NumberFormatException e) {
+                    return FormValidation.error("Please enter a valid integer.");
+                }
+            } else {
+                return FormValidation.error("Please enter a positive integer.");
             }
 
-            return model;
+            return FormValidation.ok();
+        }
+
+        /**
+         * Validation of the 'name' form Field.
+         *
+         * @param value This parameter receives the value that the user has typed.
+         * @return Indicates the outcome of the validation. This is sent to the browser.
+         */
+        public FormValidation doCheckProfileName(@QueryParameter String value) {
+            if (value.length() == 0)
+                return FormValidation.error("Please set a profile name.");
+
+            return FormValidation.ok();
         }
 
         /**
@@ -138,18 +243,6 @@ public class ContrastPluginConfig extends JobProperty<AbstractProject<?, ?>> {
         public FormValidation doCheckUsername(@QueryParameter String value) {
             if (value.length() == 0)
                 return FormValidation.error("Please set a username.");
-            return FormValidation.ok();
-        }
-
-        /**
-         * Validation of the 'profile' form Field.
-         *
-         * @param value This parameter receives the value that the user has typed.
-         * @return Indicates the outcome of the validation. This is sent to the browser.
-         */
-        public FormValidation doCheckProfileName(@QueryParameter String value) {
-            if (value.length() == 0)
-                return FormValidation.error("Please set a profile name.");
             return FormValidation.ok();
         }
 
@@ -178,14 +271,12 @@ public class ContrastPluginConfig extends JobProperty<AbstractProject<?, ?>> {
         }
 
         /**
-         * Validation of the 'orgUuid' form Field.
+         * Validation of the 'thresholdSeverity' form Field.
          *
          * @param value This parameter receives the value that the user has typed.
          * @return Indicates the outcome of the validation. This is sent to the browser.
          */
-        public FormValidation doCheckOrgUuid(@QueryParameter String value) {
-            if (value.length() == 0)
-                return FormValidation.error("Please set an Organization Uuid.");
+        public FormValidation doCheckThresholdSeverity(@QueryParameter String value) {
             return FormValidation.ok();
         }
 
@@ -202,20 +293,33 @@ public class ContrastPluginConfig extends JobProperty<AbstractProject<?, ?>> {
         }
 
         /**
-         * Validation of the 'applicationName' form Field.
+         * Validation of the 'orgUuid' form Field.
          *
          * @param value This parameter receives the value that the user has typed.
          * @return Indicates the outcome of the validation. This is sent to the browser.
          */
-        public FormValidation doCheckApplicationName(@QueryParameter String value) {
+        public FormValidation doCheckOrgUuid(@QueryParameter String value) {
             if (value.length() == 0)
-                return FormValidation.error("Please set an Application Name.");
+                return FormValidation.error("Please set an Organization Uuid.");
             return FormValidation.ok();
         }
 
         @Override
         public String getDisplayName() {
             return "Contrast Plugin Configuration";
+        }
+
+
+        public ListBoxModel doFillVulnerableBuildResultItems() {
+            ListBoxModel items = new ListBoxModel();
+
+            items.add(Result.FAILURE.toString());
+            items.add(Result.SUCCESS.toString());
+            items.add(Result.UNSTABLE.toString());
+            items.add(Result.NOT_BUILT.toString());
+            items.add(Result.ABORTED.toString());
+
+            return items;
         }
     }
 }

@@ -1,66 +1,102 @@
 package com.aspectsecurity.contrast.contrastjenkins;
 
+import hudson.util.Secret;
+import lombok.Getter;
+import lombok.Setter;
 import org.kohsuke.stapler.DataBoundConstructor;
 
+import java.util.List;
+
+@Setter
 public class TeamServerProfile {
 
+    @Getter
     private String name;
 
+    @Getter
     private String username;
 
-    private String apiKey;
+    private Secret apiKey;
 
-    private String serviceKey;
+    private Secret serviceKey;
 
+    @Getter
     private String orgUuid;
 
+    @Getter
     private String teamServerUrl;
 
+    @Getter
     private String applicationName;
 
-    private String serverName;
+    @Getter
+    private List<VulnerabilityType> vulnerabilityTypes;
+
+    private boolean applyVulnerableBuildResultOnContrastError;
+
+    @Getter
+    private String vulnerableBuildResult;
+
+    @Getter
+    private boolean allowGlobalThresholdConditionsOverride;
+
+    @Getter
+    private List<App> apps;
+
+    //Compatibility fix for plugin versions <= 3.6
+    /**
+     * @Deprecated
+     * Use {@link TeamServerProfile#applyVulnerableBuildResultOnContrastError}
+     */
+    @Getter
+    @Deprecated
+    private boolean failOnWrongApplicationId;
+
+    /////// Compatibility fix for plugin versions <=2.6
+    /**
+     * @Deprecated
+     * Use {@link TeamServerProfile#applyVulnerableBuildResultOnContrastError}
+     */
+    @Getter
+    @Deprecated
+    private boolean failOnWrongApplicationName;
 
     @DataBoundConstructor
-    public TeamServerProfile(String name, String serverName, String username, String apiKey, String serviceKey, String teamServerUrl, String orgUuid, String applicationName) {
+    public TeamServerProfile(String name, String username, String apiKey, String serviceKey, String orgUuid,
+                             String teamServerUrl, boolean applyVulnerableBuildResultOnContrastError,
+                             String vulnerableBuildResult, boolean allowGlobalThresholdConditionsOverride) {
         this.name = name;
-        this.serverName = serverName;
         this.username = username;
-        this.apiKey = apiKey;
-        this.serviceKey = serviceKey;
-        this.teamServerUrl = teamServerUrl;
+        this.apiKey = Secret.fromString(apiKey);
+        this.serviceKey = Secret.fromString(serviceKey);
         this.orgUuid = orgUuid;
-        this.applicationName = applicationName;
+        this.teamServerUrl = teamServerUrl;
+        this.applyVulnerableBuildResultOnContrastError = applyVulnerableBuildResultOnContrastError;
+        this.vulnerableBuildResult = vulnerableBuildResult;
+        this.allowGlobalThresholdConditionsOverride = allowGlobalThresholdConditionsOverride;
     }
 
-    public String getName() {
-        return name;
-    }
-
-    public String getUsername() {
-        return username;
-    }
-
-    public String getApiKey() {
+    public Secret getSecretApiKey() {
         return apiKey;
     }
 
-    public String getServiceKey() {
+    public Secret getSecretServiceKey() {
         return serviceKey;
     }
 
-    public String getOrgUuid() {
-        return orgUuid;
+    String getApiKey() {
+        return apiKey.getPlainText();
     }
 
-    public String getTeamServerUrl() {
-        return teamServerUrl;
+    String getServiceKey() {
+        return serviceKey.getPlainText();
     }
 
-    public String getApplicationName() {
-        return applicationName;
-    }
-
-    public String getServerName() {
-        return serverName;
+    public boolean isApplyVulnerableBuildResultOnContrastError() {
+      //backwards compatability fix for profiles with old configurations
+      if(!this.applyVulnerableBuildResultOnContrastError && (this.isFailOnWrongApplicationId() || this.isFailOnWrongApplicationName())) {
+        return true;
+      }
+      return this.applyVulnerableBuildResultOnContrastError;
     }
 }
